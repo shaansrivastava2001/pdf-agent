@@ -1,0 +1,26 @@
+
+# Editor directories and files
+.vscode/
+
+# Python virtual environments
+# Common names: venv/, .venv/, env/
+venv/
+ENV/
+env/
+.venv/
+
+# Python cache and compiled files
+__pycache__/
+
+# Distribution / packaging
+build/
+dist/
+
+# Secret files
+.env
+.env.*
+
+# Chroma / LangChain vector DB directory (project uses pdf_chroma_db/)
+# Ignore the persistent Chroma store and its binaries
+pdf_chroma_db/
+chroma.sqlite3
