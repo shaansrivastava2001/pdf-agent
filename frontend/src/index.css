@@ -1,0 +1,20 @@
+:root{--bg:#f7f8fb;--card:#fff;--accent:#0b5fff}
+body{font-family:Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; margin:0;background:var(--bg);color:#111}
+.container{max-width:820px;margin:32px auto;padding:0 16px}
+.card{background:var(--card);padding:16px;border-radius:8px;margin-bottom:16px;box-shadow:0 1px 3px rgba(16,24,40,0.05)}
+h1{margin:0 0 12px}
+.meta{margin-top:8px;color:#444}
+.chat .messages{height:300px;overflow:auto;padding:8px;border:1px solid #eee;border-radius:6px;background:#fafafa}
+.msg{padding:8px;border-radius:6px;margin-bottom:8px}
+.msg.user{background:#e8f0ff;text-align:right}
+.msg.assistant{background:#f1f3f5}
+.msg.system{background:#fffbe6}
+.msg .role{font-size:11px;color:#666}
+.msg .text{margin-top:4px}
+.ask{display:flex;gap:8px;margin-top:8px}
+.ask input{flex:1;padding:8px;border-radius:6px;border:1px solid #ddd}
+.ask button{padding:8px 12px;border-radius:6px;background:var(--accent);color:#fff;border:none}
+footer{margin-top:12px;color:#666}
+
+/* Simple toast/snackbar */
+.toast{position:fixed;top:20px;right:20px;background:#111;color:#fff;padding:10px 14px;border-radius:8px;box-shadow:0 6px 20px rgba(2,6,23,0.2);z-index:9999}

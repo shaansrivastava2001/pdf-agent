@@ -1,0 +1,23 @@
+# Node modules
+node_modules/
+**/node_modules/
+
+# Frontend / backend common
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# Python envs and caches
+venv/
+backend/venv/
+backend/__pycache__/
+backend/venv/
+backend/uploaded_files/
+backend/.env
+
+
+# macOS
+.DS_Store
+
+# Environment files
+.env

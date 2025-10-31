@@ -26,10 +26,44 @@ python -m pip install --upgrade pip
 pip install -r backend/requirements.txt
 ```
 
-3. Run the example:
+3. Run the FastAPI service (this project now exposes a small API):
 
 ```bash
-python backend/main.py
+# From the backend/ directory
+uvicorn app:app --reload --port 8000
+```
+
+Endpoints:
+
+- POST /upload - multipart file upload (field name: `file`) to upload a PDF and build a vector DB. Returns `doc_id`.
+- POST /start_session - JSON body {"doc_id": "..."} returns `session_id` to continue a conversation.
+- POST /query - JSON body {"question": "...", "session_id": "..."} or {"question": "...", "doc_id": "..."} to ask a question.
+- GET /status - returns uploaded doc ids and active sessions.
+
+Example curl flows:
+
+Upload a PDF:
+
+```bash
+curl -F "file=@/path/to/Employee-Handbook.pdf" http://127.0.0.1:8000/upload
+```
+
+Start a session:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/start_session" -H "Content-Type: application/json" -d '{"doc_id":"<doc_id>"}'
+```
+
+Ask a question (using session):
+
+```bash
+curl -X POST "http://127.0.0.1:8000/query" -H "Content-Type: application/json" -d '{"session_id":"<session_id>","question":"What is the recruitment process?"}'
+```
+
+Or ask a question directly by doc_id:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/query" -H "Content-Type: application/json" -d '{"doc_id":"<doc_id>","question":"What is the recruitment process?"}'
 ```
 
 Notes:
