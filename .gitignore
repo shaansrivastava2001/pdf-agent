@@ -21,3 +21,5 @@ backend/.env
 
 # Environment files
 .env
+
+docs
