@@ -1,22 +1,38 @@
 # PDF Agent Backend
 
-This backend builds a small vector store from an Employee Handbook PDF and exposes a retriever for semantic search. It's a minimal example using the Ollama embeddings and Chroma vector store.
+A FastAPI service that ingests a PDF, builds a Chroma vector store with Ollama embeddings, and answers questions over it using a local Ollama LLM. Streaming responses (SSE), per-PDF dedup via content hash, and multi-turn chat history are supported.
 
 ## Project layout
 
-- `backend/main.py` - example runner that imports the `retriever` from `vector.py` and runs queries.
-- `backend/vector.py` - builds the vector store at import-time from `Employee-Handbook.pdf`; creates `retriever`.
-- `backend/Employee-Handbook.pdf` - the source PDF used to build the vector DB.
-- `backend/pdf_chroma_db/` - persisted Chroma DB directory (created after building vectors).
-- `backend/requirements.txt` - Python dependencies for the project.
+- `backend/app.py` — FastAPI app: `/upload`, `/start_session`, `/query`, `/query/stream`, `/status`.
+- `backend/vector.py` — builds (or reuses) a Chroma vector store from a PDF and returns a retriever.
+- `backend/main.py` — optional CLI loop for asking questions against a PDF without the HTTP layer.
+- `backend/uploaded_files/` — uploaded PDFs and per-PDF Chroma persistence dirs (auto-created).
+- `backend/requirements.txt` — Python dependencies.
 
-## Quick setup (macOS / zsh)
+## Prerequisites
 
-1. Create a virtual environment and activate it (recommended):
+1. **Ollama** running locally (default: `http://127.0.0.1:11434`). Install from <https://ollama.com>.
+2. Pull the models used by the project:
 
 ```bash
-python3 -m venv backend/venv
-source backend/venv/bin/activate
+ollama pull llama3.2
+ollama pull mxbai-embed-large
+```
+
+3. Confirm Ollama is up:
+
+```bash
+ollama list
+```
+
+## Setup (macOS / zsh)
+
+1. Create and activate a virtualenv:
+
+```bash
+python3 -m venv backend/.venv
+source backend/.venv/bin/activate
 ```
 
 2. Install dependencies:
@@ -26,78 +42,98 @@ python -m pip install --upgrade pip
 pip install -r backend/requirements.txt
 ```
 
-3. Run the FastAPI service (this project now exposes a small API):
+## Run the API server
+
+From the `backend/` directory:
 
 ```bash
-# From the backend/ directory
-uvicorn app:app --reload --port 8000
+cd backend
+uvicorn app:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Endpoints:
+On startup the service performs a one-shot warmup call against Ollama so the first user query doesn't pay the model-load cost. The LLM and embedding model are configured with `keep_alive=-1` so they stay resident across requests.
 
-- POST /upload - multipart file upload (field name: `file`) to upload a PDF and build a vector DB. Returns `doc_id`.
-- POST /start_session - JSON body {"doc_id": "..."} returns `session_id` to continue a conversation.
-- POST /query - JSON body {"question": "...", "session_id": "..."} or {"question": "...", "doc_id": "..."} to ask a question.
-- GET /status - returns uploaded doc ids and active sessions.
+## Run the CLI (optional)
 
-Example curl flows:
+`main.py` runs an interactive Q&A loop without HTTP:
+
+```bash
+cd backend
+python main.py
+```
+
+It looks for `Employee-Handbook.pdf` next to `main.py`; if that file is absent, it prompts for a PDF path.
+
+## Endpoints
+
+- `POST /upload` — multipart upload (field `file`). Returns `{doc_id, filename, took_seconds, chunk_count, reused}`. The `reused` flag is `true` when the same PDF (by SHA-256) was previously indexed; the existing `doc_id` is returned and no re-embedding happens.
+- `POST /start_session?doc_id=<doc_id>` — opens a chat session whose history is fed back into subsequent prompts. Returns `{session_id}`.
+- `POST /query` — JSON `{question, session_id?, doc_id?}`. Synchronous; returns `{answer, doc_id, debug}`.
+- `POST /query/stream` — same payload as `/query`. Returns `text/event-stream` SSE with `event: token` deltas and a final `event: done` carrying `{doc_id, debug}`. Used by the frontend.
+- `GET /status` — uploaded doc ids and active sessions.
+
+## Example curl flows
 
 Upload a PDF:
 
 ```bash
-curl -F "file=@/path/to/Employee-Handbook.pdf" http://127.0.0.1:8000/upload
+curl -F "file=@/path/to/your.pdf" http://127.0.0.1:8000/upload
 ```
 
 Start a session:
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/start_session" -H "Content-Type: application/json" -d '{"doc_id":"<doc_id>"}'
+curl -X POST "http://127.0.0.1:8000/start_session?doc_id=<doc_id>"
 ```
 
-Ask a question (using session):
+Ask a question (synchronous):
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/query" -H "Content-Type: application/json" -d '{"session_id":"<session_id>","question":"What is the recruitment process?"}'
+curl -X POST "http://127.0.0.1:8000/query" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id":"<session_id>","question":"What is the recruitment process?"}'
 ```
 
-Or ask a question directly by doc_id:
+Ask a question (streaming):
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/query" -H "Content-Type: application/json" -d '{"doc_id":"<doc_id>","question":"What is the recruitment process?"}'
+curl -N -X POST "http://127.0.0.1:8000/query/stream" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id":"<session_id>","question":"Summarize the leave policy"}'
 ```
 
-Notes:
-- The project resolves the PDF path relative to `vector.py`. If you move files, ensure `Employee-Handbook.pdf` is next to `vector.py` or update the path.
-- The first import of `vector.py` will build the vector DB and may take some time and memory. The code checks for the `pdf_chroma_db` directory and only re-adds documents if it doesn't exist.
+Or query directly by `doc_id` (no session, no history):
+
+```bash
+curl -X POST "http://127.0.0.1:8000/query" \
+  -H "Content-Type: application/json" \
+  -d '{"doc_id":"<doc_id>","question":"What is the recruitment process?"}'
+```
+
+## How indexing & dedup work
+
+- On upload the server hashes the PDF bytes (SHA-256, first 16 hex chars) and uses that as both the on-disk filename prefix and the Chroma `persist_directory` name (`uploaded_files/<hash>_chroma`).
+- If the persist dir already contains embeddings, they are reused — re-uploading the same PDF is effectively free.
+- An in-memory `HASH_INDEX` also returns the existing `doc_id` for an exact re-upload during the same process lifetime.
+
+## Configuration knobs (in `app.py`)
+
+- `OllamaLLM(model="llama3.2", temperature=0, num_ctx=8192, num_predict=512, keep_alive=-1)`
+- `OllamaEmbeddings(model="mxbai-embed-large", keep_alive=-1)` (in `vector.py`)
+- Chunking: `RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)` in `vector.py`.
+- Retrieval: similarity search with `k=5`.
+
+## Rebuilding a vector store
+
+Delete the per-PDF persist dir to force a re-embed on next upload:
+
+```bash
+rm -rf backend/uploaded_files/<hash>_chroma
+```
 
 ## Troubleshooting
 
-- ValueError: "File path Employee_Handbook.pdf is not a valid file or url"
-  - This happens if the loader receives the wrong filename or a relative path that doesn't point to the PDF. `vector.py` resolves the path relative to the file using `os.path.join(os.path.dirname(__file__), "Employee-Handbook.pdf")`.
-  - Confirm the file exists next to `vector.py`:
-
-```bash
-ls -l backend/Employee-Handbook.pdf
-```
-
-- Missing packages / ModuleNotFoundError
-  - Activate the virtualenv and run `pip install -r backend/requirements.txt`. If errors persist, check the Python version (this project used Python 3.13 when created).
-
-## Optional improvements
-
-- Make vector DB creation lazy: move heavy initialization from module scope into a function like `get_retriever()` so importing `vector` is lightweight. This prevents long import times and side effects during unit tests.
-
-- Add a small CLI to build or query the DB explicitly instead of building on import.
-
-## Rebuilding the vector DB
-
-To force-rebuild the vector DB, remove the `backend/pdf_chroma_db/` directory (or back it up) and run `python backend/main.py` again.
-
-```bash
-rm -rf backend/pdf_chroma_db
-python backend/main.py
-```
-
-## Contact
-
-If you need help with packages (e.g., `langchain_ollama`, `langchain_chroma`), include the pip install output and the Python version in your issue.
+- **`ConnectionError` to `127.0.0.1:11434`** — Ollama isn't running. Start it (`ollama serve` or launch the app) and confirm `ollama list` works.
+- **Slow first request** — the warmup at startup mitigates this, but if it failed (Ollama not yet up), the first real query will pay the model-load cost.
+- **`ModuleNotFoundError`** — activate the venv (`source backend/.venv/bin/activate`) and re-run `pip install -r backend/requirements.txt`.
+- **Empty/garbage answers** — check `/query` debug payload; if `retrieved_count` is 0 the keyword-overlap fallback kicks in. Verify the PDF text-extracted correctly (scanned PDFs need OCR upstream).

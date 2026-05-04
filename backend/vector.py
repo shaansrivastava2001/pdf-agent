@@ -7,8 +7,9 @@ uploaded document.
 """
 
 import os
+import hashlib
 import logging
-from typing import List
+from typing import List, Tuple
 from pathlib import Path
 
 from langchain_community.document_loaders import PyPDFLoader
@@ -21,96 +22,123 @@ logger = logging.getLogger("pdf-agent.vector")
 # Default embedding model used in the project
 DEFAULT_EMBEDDING_MODEL = "mxbai-embed-large"
 
+# keep_alive=-1 keeps the embedding model resident in Ollama indefinitely so
+# subsequent embed calls don't pay reload cost.
+_embeddings = OllamaEmbeddings(model=DEFAULT_EMBEDDING_MODEL, keep_alive=-1)
 
-def create_retriever_from_pdf(pdf_path: str, persist_dir: str = None, collection_name: str = None):
+
+def compute_file_hash(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def create_retriever_from_pdf(
+    pdf_path: str, persist_dir: str = None, collection_name: str = None
+) -> Tuple[object, dict]:
     """Create (or load) a Chroma vector store from a PDF and return a Retriever.
 
     - pdf_path: path to the uploaded PDF file
     - persist_dir: directory where Chroma will persist DB files. If None,
-      a folder next to the PDF will be used: `<pdf_parent>/<pdf_stem>_chroma`.
+      a content-hash-keyed folder is used so re-uploads of the same PDF
+      reuse existing embeddings.
     - collection_name: optional Chroma collection name.
 
-    Returns a langchain Retriever instance.
+    Returns (retriever, info).
     """
     pdf_path = str(pdf_path)
     pdf_file = Path(pdf_path)
+    file_hash = compute_file_hash(pdf_path)
 
     if persist_dir is None:
-        persist_dir = str(pdf_file.parent / f"{pdf_file.stem}_chroma")
+        persist_dir = str(pdf_file.parent / f"{file_hash}_chroma")
 
     os.makedirs(persist_dir, exist_ok=True)
 
-    # Load and split PDF
-    loader = PyPDFLoader(pdf_path)
-    pages = loader.load()
-    logger.info("Loaded PDF %s with %d pages", pdf_file.name, len(pages))
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    documents = splitter.split_documents(pages)
-    logger.info("Split PDF into %d document chunks", len(documents))
-
-    # Embeddings and vector store
-    embeddings = OllamaEmbeddings(model=DEFAULT_EMBEDDING_MODEL)
-
+    # Open (or create) the vector store first so we can check whether it
+    # already has embeddings before re-parsing the PDF.
     vector_store = Chroma(
         collection_name=collection_name or "pdf_knowledge_base",
         persist_directory=persist_dir,
-        embedding_function=embeddings,
+        embedding_function=_embeddings,
     )
 
-    # If the store is empty, add documents
-    # Chroma persistence layout varies; a simple heuristic is to check for files
-    # inside the persist_dir. If empty, add documents.
-    dir_is_empty = not any(Path(persist_dir).iterdir())
-    if dir_is_empty:
+    existing_count = 0
+    try:
+        existing_count = vector_store._collection.count()
+    except Exception:
+        try:
+            existing_count = len(vector_store.get(limit=1).get("ids", []))
+        except Exception:
+            existing_count = 0
+
+    documents = []
+    if existing_count == 0:
+        loader = PyPDFLoader(pdf_path)
+        pages = loader.load()
+        logger.info("Loaded PDF %s with %d pages", pdf_file.name, len(pages))
+
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        documents = splitter.split_documents(pages)
+        logger.info("Split PDF into %d document chunks", len(documents))
+
         logger.info("Creating new vector DB at %s from %s", persist_dir, pdf_file.name)
         vector_store.add_documents(documents)
-        try:
-            vector_store.persist()
-        except Exception:
-            # Some Chroma bindings persist automatically; ignore failures.
-            logger.debug("Chroma persist() call failed or not supported; continuing")
         logger.info("Vector DB created successfully at %s", persist_dir)
+    else:
+        logger.info(
+            "Reusing existing vector DB at %s (%d embeddings)", persist_dir, existing_count
+        )
 
     retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 5})
 
-    # Prepare small info payload for debugging: number of chunks and a few samples
-    samples = []
+    # Lightweight debug payload. When we reused an existing store we don't
+    # have the freshly-split docs; pull a few samples from Chroma instead so
+    # the keyword-fallback path in app.py keeps working across restarts.
+    samples: List[str] = []
+    chunks: List[str] = []
     try:
-        for d in documents[:3]:
-            txt = getattr(d, "page_content", str(d))
-            samples.append(txt.replace("\n", " ")[:400])
+        if documents:
+            for d in documents[:3]:
+                samples.append(getattr(d, "page_content", str(d)).replace("\n", " ")[:400])
+            for d in documents:
+                chunks.append(" ".join(getattr(d, "page_content", str(d)).split()))
+        else:
+            stored = vector_store.get()
+            stored_docs = stored.get("documents") or []
+            for txt in stored_docs[:3]:
+                samples.append(str(txt).replace("\n", " ")[:400])
+            for txt in stored_docs:
+                chunks.append(" ".join(str(txt).split()))
     except Exception:
-        logger.debug("Could not create document samples for debug")
+        logger.debug("Could not assemble document samples for debug")
 
-    # Keep a lightweight list of chunk texts for debugging and simple fallbacks.
-    chunks = []
-    try:
-        for d in documents:
-            txt = getattr(d, "page_content", str(d))
-            # keep full chunk but trim excessive whitespace
-            chunks.append(" ".join(txt.split()))
-    except Exception:
-        logger.debug("Could not serialize all document chunks for debug")
-
-    info = {"chunk_count": len(documents), "samples": samples, "chunks": chunks}
+    chunk_count = len(documents) if documents else existing_count
+    info = {
+        "chunk_count": chunk_count,
+        "samples": samples,
+        "chunks": chunks,
+        "file_hash": file_hash,
+        "persist_dir": persist_dir,
+    }
     return retriever, info
 
 
 def retrieve_documents(retriever, query: str, k: int = 5) -> List:
     """Return the list of relevant Document objects for a query using the retriever."""
-    # LangChain retrievers typically implement get_relevant_documents
+    if hasattr(retriever, "invoke"):
+        docs = retriever.invoke(query)
+        return docs[:k]
+
+    # Older retriever API
     if hasattr(retriever, "get_relevant_documents"):
         docs = retriever.get_relevant_documents(query)
         return docs[:k]
 
-    # Some retrievers expose `retrieve`
     if hasattr(retriever, "retrieve"):
         docs = retriever.retrieve(query)
         return docs[:k]
-
-    # Fallback: if retriever was created with a custom .invoke (older code), try that
-    if hasattr(retriever, "invoke"):
-        return retriever.invoke(query)
 
     raise AttributeError("Retriever does not support document retrieval methods")
