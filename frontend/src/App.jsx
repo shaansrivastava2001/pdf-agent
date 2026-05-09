@@ -17,6 +17,9 @@ const Icon = {
   Copy: (p) => <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>,
   Menu: (p) => <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>,
   Sparkles: (p) => <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" {...p}><path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M5.6 18.4l2.8-2.8M15.6 8.4l2.8-2.8"/></svg>,
+  Plus: (p) => <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>,
+  Trash: (p) => <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/></svg>,
+  Chat: (p) => <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" {...p}><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>,
 }
 
 const fmtSeconds = (s) => {
@@ -30,6 +33,38 @@ const fmtBytes = (n) => {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
   return `${(n / 1024 / 1024).toFixed(2)} MB`
 }
+const fmtRelative = (epochSec) => {
+  if (!epochSec) return ''
+  const diff = Date.now() / 1000 - epochSec
+  if (diff < 60) return 'just now'
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`
+  if (diff < 7 * 86400) return `${Math.floor(diff / 86400)}d ago`
+  return new Date(epochSec * 1000).toLocaleDateString()
+}
+
+// Convert server-side metrics ({retrieval_time_s, model_time_s}) to the
+// shape the Metrics component expects.
+const normalizeMetrics = (m) => {
+  if (!m) return null
+  return {
+    retrieval_s: m.retrieval_time_s ?? m.retrieval_s,
+    model_s: m.model_time_s ?? m.model_s,
+    wall_s: m.wall_s,
+    retrieved: m.retrieved,
+    tokens: m.tokens,
+    tokens_per_s: m.tokens_per_s,
+  }
+}
+
+const serverMessageToClient = (m) => ({
+  id: m.message_id,
+  role: m.role,
+  text: m.content,
+  ts: (m.created_at || 0) * 1000,
+  metrics: normalizeMetrics(m.metrics),
+  sources: m.sources || [],
+})
 
 /* ---------- SSE helper ---------- */
 async function consumeSSE(response, onEvent) {
@@ -59,10 +94,10 @@ async function consumeSSE(response, onEvent) {
    App
    ============================================================ */
 export default function App() {
-  const [docs, setDocs] = useState([])           // [{doc_id, filename, chunk_count, took_seconds, size}]
-  const [activeDocId, setActiveDocId] = useState(null)
-  const [sessionByDoc, setSessionByDoc] = useState({}) // doc_id -> session_id
-  const [messagesByDoc, setMessagesByDoc] = useState({}) // doc_id -> messages[]
+  const [docs, setDocs] = useState([])             // [{doc_id, filename, chunk_count, size_bytes, ...}]
+  const [chats, setChats] = useState([])           // [{chat_id, doc_id, title, filename, updated_at, ...}]
+  const [activeChatId, setActiveChatId] = useState(null)
+  const [messagesByChat, setMessagesByChat] = useState({}) // chat_id -> messages[]
   const [question, setQuestion] = useState('')
   const [uploading, setUploading] = useState(false)
   const [streaming, setStreaming] = useState(false)
@@ -70,13 +105,15 @@ export default function App() {
   const [dragOver, setDragOver] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [backendOk, setBackendOk] = useState(null) // null=unknown, true=ok, false=down
+  const [docsExpanded, setDocsExpanded] = useState(true)
 
   const messagesEndRef = useRef(null)
   const fileInputRef = useRef(null)
   const textareaRef = useRef(null)
 
-  const activeDoc = docs.find(d => d.doc_id === activeDocId) || null
-  const messages = activeDocId ? (messagesByDoc[activeDocId] || []) : []
+  const activeChat = chats.find(c => c.chat_id === activeChatId) || null
+  const activeDoc = activeChat ? (docs.find(d => d.doc_id === activeChat.doc_id) || null) : null
+  const messages = activeChatId ? (messagesByChat[activeChatId] || []) : []
 
   /* ----- toast helper ----- */
   function showToast(message, ms = 2400) {
@@ -100,6 +137,52 @@ export default function App() {
     return () => { cancelled = true; clearInterval(id) }
   }, [])
 
+  /* ----- initial load: documents + chats ----- */
+  useEffect(() => {
+    let cancelled = false
+    const load = async () => {
+      try {
+        const [docsRes, chatsRes] = await Promise.all([
+          fetch(`${API_BASE}/documents`).then(r => r.json()),
+          fetch(`${API_BASE}/chats`).then(r => r.json()),
+        ])
+        if (cancelled) return
+        const ds = (docsRes.documents || []).map(d => ({
+          doc_id: d.doc_id,
+          filename: d.filename,
+          chunk_count: d.chunk_count,
+          size: d.size_bytes,
+        }))
+        setDocs(ds)
+        setChats(chatsRes.chats || [])
+      } catch (err) {
+        // backend may simply be down — health ping will reflect that
+      }
+    }
+    load()
+    return () => { cancelled = true }
+  }, [])
+
+  /* ----- when a chat becomes active, fetch its messages if not cached ----- */
+  useEffect(() => {
+    if (!activeChatId) return
+    if (messagesByChat[activeChatId]) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/chats/${activeChatId}`)
+        if (!res.ok) throw new Error(await res.text())
+        const data = await res.json()
+        if (cancelled) return
+        const msgs = (data.messages || []).map(serverMessageToClient)
+        setMessagesByChat(prev => ({...prev, [activeChatId]: msgs}))
+      } catch (err) {
+        showToast('Failed to load chat history', 3000)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [activeChatId])
+
   /* ----- auto-scroll ----- */
   useEffect(() => {
     if (messagesEndRef.current) {
@@ -114,6 +197,60 @@ export default function App() {
     el.style.height = 'auto'
     el.style.height = Math.min(el.scrollHeight, 180) + 'px'
   }, [question])
+
+  /* ----- chat helpers ----- */
+  const refreshChats = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/chats`)
+      const data = await res.json()
+      setChats(data.chats || [])
+    } catch { /* ignore */ }
+  }, [])
+
+  const createChatForDoc = useCallback(async (docId, title = null) => {
+    const res = await fetch(`${API_BASE}/chats`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({doc_id: docId, title}),
+    })
+    if (!res.ok) throw new Error(await res.text())
+    const chat = await res.json()
+    const docFilename = (docs.find(d => d.doc_id === docId) || {}).filename
+    setChats(prev => [{...chat, filename: docFilename, message_count: 0}, ...prev])
+    return chat
+  }, [docs])
+
+  const newChat = useCallback(async (docId) => {
+    if (!docId) {
+      showToast('Upload a PDF first')
+      return
+    }
+    try {
+      const chat = await createChatForDoc(docId)
+      setActiveChatId(chat.chat_id)
+      setMessagesByChat(prev => ({...prev, [chat.chat_id]: []}))
+      setSidebarOpen(false)
+    } catch (err) {
+      showToast('Failed to create chat: ' + err.message, 3000)
+    }
+  }, [createChatForDoc])
+
+  const deleteChat = useCallback(async (chatId) => {
+    if (!window.confirm('Delete this chat? This cannot be undone.')) return
+    try {
+      const res = await fetch(`${API_BASE}/chats/${chatId}`, {method: 'DELETE'})
+      if (!res.ok) throw new Error(await res.text())
+      setChats(prev => prev.filter(c => c.chat_id !== chatId))
+      setMessagesByChat(prev => {
+        const next = {...prev}
+        delete next[chatId]
+        return next
+      })
+      if (activeChatId === chatId) setActiveChatId(null)
+    } catch (err) {
+      showToast('Delete failed: ' + err.message, 3000)
+    }
+  }, [activeChatId])
 
   /* ----- upload ----- */
   const uploadFile = useCallback(async (file) => {
@@ -134,32 +271,33 @@ export default function App() {
 
       setDocs(prev => {
         if (prev.some(d => d.doc_id === data.doc_id)) return prev
-        return [...prev, {
+        return [{
           doc_id: data.doc_id,
           filename: data.filename,
           chunk_count: data.chunk_count,
           took_seconds: data.took_seconds,
           size: file.size,
           reused: data.reused,
-        }]
+        }, ...prev]
       })
-      setActiveDocId(data.doc_id)
-      setMessagesByDoc(prev => ({
-        ...prev,
-        [data.doc_id]: prev[data.doc_id] || [{
-          role: 'system',
-          text: data.reused
-            ? `Reused existing index for ${data.filename}`
-            : `Indexed ${data.filename} · ${data.chunk_count} chunks · ${fmtSeconds(data.took_seconds)}`,
-        }],
-      }))
+
+      // Auto-create a fresh chat for this PDF (or for the dedup'd one).
+      const chat = await createChatForDoc(data.doc_id)
+      const welcome = {
+        role: 'system',
+        text: data.reused
+          ? `Reused existing index for ${data.filename}`
+          : `Indexed ${data.filename} · ${data.chunk_count} chunks · ${fmtSeconds(data.took_seconds)}`,
+      }
+      setMessagesByChat(prev => ({...prev, [chat.chat_id]: [welcome]}))
+      setActiveChatId(chat.chat_id)
       setSidebarOpen(false)
     } catch (err) {
       showToast('Upload failed: ' + err.message, 4000)
     } finally {
       setUploading(false)
     }
-  }, [])
+  }, [createChatForDoc])
 
   const onFilePick = (e) => {
     const f = e.target.files && e.target.files[0]
@@ -175,46 +313,35 @@ export default function App() {
   }
 
   /* ----- ask ----- */
-  async function ensureSession(docId) {
-    if (sessionByDoc[docId]) return sessionByDoc[docId]
-    const res = await fetch(`${API_BASE}/start_session?doc_id=${docId}`, {method: 'POST'})
-    const txt = await res.text()
-    let data
-    try { data = JSON.parse(txt) } catch { data = {raw: txt} }
-    if (!res.ok) throw new Error(data.detail || data.raw || 'Failed to start session')
-    setSessionByDoc(prev => ({...prev, [docId]: data.session_id}))
-    return data.session_id
-  }
-
   async function sendQuestion(e) {
     e && e.preventDefault()
     const q = question.trim()
     if (!q) return
-    if (!activeDocId) {
-      showToast('Upload a PDF first')
+    if (!activeChat) {
+      showToast(docs.length ? 'Start a chat first' : 'Upload a PDF first')
       return
     }
-    const docId = activeDocId
+    const chatId = activeChat.chat_id
     setQuestion('')
 
-    // Append user + placeholder assistant messages
+    // Append user + placeholder assistant messages locally for streaming UX.
     const placeholderId = Date.now()
-    setMessagesByDoc(prev => ({
+    setMessagesByChat(prev => ({
       ...prev,
-      [docId]: [
-        ...(prev[docId] || []),
+      [chatId]: [
+        ...(prev[chatId] || []),
         {role: 'user', text: q, ts: Date.now()},
         {role: 'assistant', text: '', streaming: true, id: placeholderId, ts: Date.now()},
       ],
     }))
 
     const updateLast = (mutator) => {
-      setMessagesByDoc(prev => {
-        const list = prev[docId] || []
+      setMessagesByChat(prev => {
+        const list = prev[chatId] || []
         if (!list.length) return prev
         const next = list.slice()
         next[next.length - 1] = mutator(next[next.length - 1])
-        return {...prev, [docId]: next}
+        return {...prev, [chatId]: next}
       })
     }
 
@@ -222,11 +349,10 @@ export default function App() {
     let tokenCount = 0
     const wallStart = performance.now()
     try {
-      const sessionId = await ensureSession(docId)
       const res = await fetch(`${API_BASE}/query/stream`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json', Accept: 'text/event-stream'},
-        body: JSON.stringify({session_id: sessionId, question: q}),
+        body: JSON.stringify({chat_id: chatId, question: q}),
       })
       if (!res.ok) {
         const errText = await res.text()
@@ -264,6 +390,10 @@ export default function App() {
         },
         sources: debug.snippets || [],
       }))
+
+      // Refresh chat list so the title (auto-named from first question) and
+      // updated_at order reflect on the sidebar.
+      refreshChats()
     } catch (err) {
       updateLast(m => ({
         ...m,
@@ -284,8 +414,8 @@ export default function App() {
     }
   }
 
-  function selectDoc(docId) {
-    setActiveDocId(docId)
+  function selectChat(chatId) {
+    setActiveChatId(chatId)
     setSidebarOpen(false)
   }
 
@@ -308,28 +438,78 @@ export default function App() {
           </div>
         </div>
 
-        <div className="sidebar-section">Documents</div>
+        <div className="sidebar-section">
+          <span>Chats</span>
+        </div>
         <div className="doc-list">
-          {docs.length === 0 ? (
-            <div className="doc-list-empty">No PDFs yet. Upload one below.</div>
-          ) : docs.map(d => (
-            <button
-              key={d.doc_id}
-              className={`doc-item ${d.doc_id === activeDocId ? 'active' : ''}`}
-              onClick={() => selectDoc(d.doc_id)}
-              title={d.filename}
+          {chats.length === 0 ? (
+            <div className="doc-list-empty">
+              No chats yet. {docs.length === 0 ? 'Upload a PDF below to start.' : 'Pick a document to begin.'}
+            </div>
+          ) : chats.map(c => (
+            <div
+              key={c.chat_id}
+              className={`doc-item chat-item ${c.chat_id === activeChatId ? 'active' : ''}`}
+              role="button"
+              tabIndex={0}
+              onClick={() => selectChat(c.chat_id)}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectChat(c.chat_id) } }}
+              title={c.title || c.filename}
             >
-              <Icon.Doc className="doc-icon" />
+              <Icon.Chat className="doc-icon" />
               <div className="doc-item-meta">
-                <span className="doc-item-name">{d.filename}</span>
+                <span className="doc-item-name">{c.title || 'New chat'}</span>
                 <span className="doc-item-sub">
-                  {d.chunk_count != null ? `${d.chunk_count} chunks` : '—'}
-                  {d.size ? ` · ${fmtBytes(d.size)}` : ''}
+                  {c.filename}
+                  {c.updated_at ? ` · ${fmtRelative(c.updated_at)}` : ''}
                 </span>
               </div>
-            </button>
+              <button
+                className="icon-btn chat-delete"
+                onClick={(e) => { e.stopPropagation(); deleteChat(c.chat_id) }}
+                title="Delete chat"
+                aria-label="Delete chat"
+              >
+                <Icon.Trash />
+              </button>
+            </div>
           ))}
         </div>
+
+        <div className="sidebar-section toggleable" onClick={() => setDocsExpanded(v => !v)} role="button" tabIndex={0}>
+          <span>Documents{docs.length ? ` (${docs.length})` : ''}</span>
+          <Icon.ChevRight style={{transform: docsExpanded ? 'rotate(90deg)' : 'none', transition: 'transform 120ms'}} />
+        </div>
+        {docsExpanded && (
+          <div className="doc-list">
+            {docs.length === 0 ? (
+              <div className="doc-list-empty">No PDFs yet.</div>
+            ) : docs.map(d => (
+              <div
+                key={d.doc_id}
+                className="doc-item"
+                title={d.filename}
+              >
+                <Icon.Doc className="doc-icon" />
+                <div className="doc-item-meta">
+                  <span className="doc-item-name">{d.filename}</span>
+                  <span className="doc-item-sub">
+                    {d.chunk_count != null ? `${d.chunk_count} chunks` : '—'}
+                    {d.size ? ` · ${fmtBytes(d.size)}` : ''}
+                  </span>
+                </div>
+                <button
+                  className="icon-btn chat-delete"
+                  onClick={(e) => { e.stopPropagation(); newChat(d.doc_id) }}
+                  title="New chat with this PDF"
+                  aria-label="New chat with this PDF"
+                >
+                  <Icon.Plus />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
 
         <div className="sidebar-footer">
           <label

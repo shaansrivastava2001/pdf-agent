@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import logging
 import time
 import traceback
@@ -10,21 +11,23 @@ from uuid import uuid4
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from langchain_ollama import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
 
+import storage
 from vector import create_retriever_from_pdf, retrieve_documents
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("pdf-agent")
 
-# In-memory stores (single-process service)
-DOCS = {}      # doc_id -> {"persist_dir", "filename", "retriever", "info", "file_hash"}
-HASH_INDEX = {}  # file_hash -> doc_id  (lets us dedupe re-uploads of the same PDF)
-SESSIONS = {}  # session_id -> {"doc_id", "history"}
+# In-memory caches of objects that can't live in SQLite (retrievers, the
+# chunked text used by the keyword fallback). Hydrated from disk at startup
+# and updated on /upload. Persistent state of record is the SQLite DB.
+DOCS = {}        # doc_id -> {"persist_dir", "filename", "retriever", "info", "file_hash", "file_path"}
+HASH_INDEX = {}  # file_hash -> doc_id
 
 # OllamaLLM tuning:
 #  - temperature=0       deterministic answers for RAG
@@ -63,8 +66,85 @@ def format_history(history, max_turns: int = 5) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+def _backfill_documents_from_disk() -> None:
+    """Register PDFs that exist under uploaded_files/ but aren't in the DB yet.
+
+    Filenames follow the {hash}_{original}.pdf convention written by /upload,
+    paired with a {hash}_chroma/ persist dir. We only adopt entries that match
+    that convention so we don't mistakenly index stray files.
+    """
+    uploads_dir = Path("uploaded_files")
+    if not uploads_dir.exists():
+        return
+    for pdf in uploads_dir.glob("*.pdf"):
+        name = pdf.name
+        underscore = name.find("_")
+        if underscore <= 0:
+            continue
+        file_hash = name[:underscore]
+        if len(file_hash) != 16:
+            continue
+        persist_dir = uploads_dir / f"{file_hash}_chroma"
+        if not persist_dir.exists():
+            continue
+        if storage.get_document_by_hash(file_hash):
+            continue
+        storage.upsert_document(
+            doc_id=uuid4().hex,
+            file_hash=file_hash,
+            filename=name[underscore + 1:],
+            file_path=str(pdf),
+            persist_dir=str(persist_dir),
+            chunk_count=None,
+            size_bytes=pdf.stat().st_size,
+        )
+        logger.info("Backfilled existing PDF into storage: %s", name)
+
+
+def _rehydrate_documents() -> None:
+    """Rebuild DOCS/HASH_INDEX from persisted document rows.
+
+    create_retriever_from_pdf is idempotent: when the persist_dir already has
+    embeddings it reuses them without re-parsing. So we just call it again
+    against each known PDF + persist_dir.
+    """
+    for row in storage.list_documents():
+        file_path = row["file_path"]
+        persist_dir = row["persist_dir"]
+        if not Path(file_path).exists() or not Path(persist_dir).exists():
+            logger.warning("Skipping rehydrate for %s: missing %s or %s",
+                           row["filename"], file_path, persist_dir)
+            continue
+        try:
+            retriever, info = create_retriever_from_pdf(file_path, persist_dir)
+        except Exception as e:
+            logger.warning("Failed to rehydrate %s: %s", row["filename"], e)
+            continue
+        DOCS[row["doc_id"]] = {
+            "persist_dir": persist_dir,
+            "filename": row["filename"],
+            "retriever": retriever,
+            "info": info,
+            "file_hash": row["file_hash"],
+            "file_path": file_path,
+        }
+        HASH_INDEX[row["file_hash"]] = row["doc_id"]
+    if DOCS:
+        logger.info("Rehydrated %d document(s) from storage", len(DOCS))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    storage.init()
+    try:
+        await asyncio.to_thread(_backfill_documents_from_disk)
+    except Exception as e:
+        logger.warning("Document backfill failed: %s", e)
+    try:
+        await asyncio.to_thread(_rehydrate_documents)
+    except Exception as e:
+        logger.warning("Document rehydration failed: %s", e)
+
     # Best-effort warmup so the first user query doesn't pay the model load cost.
     try:
         await chain.ainvoke({"context": "ready", "question": "say ok", "history": ""})
@@ -87,23 +167,34 @@ app.add_middleware(
 
 class QueryRequest(BaseModel):
     question: str
-    session_id: Optional[str] = None
+    chat_id: Optional[str] = None
     doc_id: Optional[str] = None
 
 
+class CreateChatRequest(BaseModel):
+    doc_id: str
+    title: Optional[str] = None
+
+
+class RenameChatRequest(BaseModel):
+    title: str
+
+
 def _resolve_retriever(req: QueryRequest):
-    """Returns (retriever, session_or_none, doc_id)."""
-    if req.session_id:
-        session = SESSIONS.get(req.session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="session_id not found")
-        doc_id = session["doc_id"]
-        return DOCS[doc_id]["retriever"], session, doc_id
+    """Returns (retriever, chat_or_none, doc_id)."""
+    if req.chat_id:
+        chat = storage.get_chat(req.chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="chat_id not found")
+        doc_id = chat["doc_id"]
+        if doc_id not in DOCS:
+            raise HTTPException(status_code=404, detail="associated doc not loaded")
+        return DOCS[doc_id]["retriever"], chat, doc_id
     if req.doc_id:
         if req.doc_id not in DOCS:
             raise HTTPException(status_code=404, detail="doc_id not found; upload first")
         return DOCS[req.doc_id]["retriever"], None, req.doc_id
-    raise HTTPException(status_code=400, detail="Provide session_id or doc_id")
+    raise HTTPException(status_code=400, detail="Provide chat_id or doc_id")
 
 
 def _build_context(retriever, question: str):
@@ -129,6 +220,13 @@ def _keyword_fallback(question: str, doc_info: dict) -> Optional[str]:
     scored.sort(key=lambda x: x[0], reverse=True)
     top = [c for _, c in scored[:3]]
     return "\n\n".join(top) if top else None
+
+
+def _auto_title_from_question(question: str, max_len: int = 60) -> str:
+    q = " ".join(question.split())
+    if len(q) <= max_len:
+        return q
+    return q[: max_len - 1].rstrip() + "…"
 
 
 @app.post("/upload")
@@ -185,8 +283,19 @@ async def upload_pdf(file: UploadFile = File(...)):
         "retriever": retriever,
         "info": info,
         "file_hash": file_hash,
+        "file_path": str(dest_path),
     }
     HASH_INDEX[file_hash] = doc_id
+
+    storage.upsert_document(
+        doc_id=doc_id,
+        file_hash=file_hash,
+        filename=file.filename,
+        file_path=str(dest_path),
+        persist_dir=persist_dir,
+        chunk_count=info.get("chunk_count"),
+        size_bytes=len(contents),
+    )
 
     return {
         "doc_id": doc_id,
@@ -197,18 +306,81 @@ async def upload_pdf(file: UploadFile = File(...)):
     }
 
 
-@app.post("/start_session")
-async def start_session(doc_id: str):
-    logger.info("Start session requested for doc_id=%s", doc_id)
-    if doc_id not in DOCS:
-        logger.warning("start_session: doc_id not found: %s", doc_id)
-        raise HTTPException(status_code=404, detail="doc_id not found; upload first")
+# ---------- documents ----------
 
-    session_id = uuid4().hex
-    SESSIONS[session_id] = {"doc_id": doc_id, "history": []}
-    logger.info("Session started: %s -> doc %s", session_id, doc_id)
-    return {"session_id": session_id}
+@app.get("/documents")
+def list_documents():
+    docs_rows = storage.list_documents()
+    return {"documents": [
+        {
+            "doc_id": r["doc_id"],
+            "filename": r["filename"],
+            "chunk_count": r["chunk_count"],
+            "size_bytes": r["size_bytes"],
+            "created_at": r["created_at"],
+            "loaded": r["doc_id"] in DOCS,
+        }
+        for r in docs_rows
+    ]}
 
+
+@app.get("/pdf/{doc_id}")
+def get_pdf(doc_id: str):
+    row = storage.get_document(doc_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="doc_id not found")
+    path = Path(row["file_path"])
+    if not path.exists():
+        raise HTTPException(status_code=410, detail="PDF file missing on disk")
+    return FileResponse(path, media_type="application/pdf", filename=row["filename"])
+
+
+# ---------- chats ----------
+
+@app.get("/chats")
+def list_chats():
+    return {"chats": storage.list_chats()}
+
+
+@app.post("/chats")
+def create_chat(req: CreateChatRequest):
+    if req.doc_id not in DOCS:
+        # Allow creating chats for docs that exist in storage but aren't loaded
+        # (e.g. PDF file deleted). Soft-check so the caller gets a clear error.
+        if not storage.get_document(req.doc_id):
+            raise HTTPException(status_code=404, detail="doc_id not found")
+    chat = storage.create_chat(req.doc_id, req.title)
+    return chat
+
+
+@app.get("/chats/{chat_id}")
+def get_chat(chat_id: str):
+    chat = storage.get_chat(chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="chat_id not found")
+    doc = storage.get_document(chat["doc_id"])
+    return {
+        "chat": chat,
+        "document": doc,
+        "messages": storage.list_messages(chat_id),
+    }
+
+
+@app.patch("/chats/{chat_id}")
+def rename_chat(chat_id: str, req: RenameChatRequest):
+    if not storage.rename_chat(chat_id, req.title):
+        raise HTTPException(status_code=404, detail="chat_id not found")
+    return storage.get_chat(chat_id)
+
+
+@app.delete("/chats/{chat_id}")
+def delete_chat(chat_id: str):
+    if not storage.delete_chat(chat_id):
+        raise HTTPException(status_code=404, detail="chat_id not found")
+    return {"ok": True}
+
+
+# ---------- query ----------
 
 def _gather_debug(docs, snippets, took_retrieval, took_model, doc_info):
     debug_payload = {
@@ -223,12 +395,26 @@ def _gather_debug(docs, snippets, took_retrieval, took_model, doc_info):
     return debug_payload
 
 
+def _persist_turn(chat: Optional[dict], question: str, answer: str,
+                  metrics: dict, sources: list) -> None:
+    if not chat:
+        return
+    storage.add_message(chat_id=chat["chat_id"], role="user", content=question)
+    storage.add_message(
+        chat_id=chat["chat_id"], role="assistant", content=answer,
+        metrics=metrics, sources=sources,
+    )
+    # Auto-name the chat from its first user message if not yet titled.
+    if not chat.get("title"):
+        storage.rename_chat(chat["chat_id"], _auto_title_from_question(question))
+
+
 @app.post("/query")
 async def query(req: QueryRequest):
-    retriever, session, doc_id = _resolve_retriever(req)
+    retriever, chat, doc_id = _resolve_retriever(req)
     logger.info(
-        "Query request: session_id=%s doc_id=%s question=%s",
-        req.session_id, req.doc_id, req.question,
+        "Query request: chat_id=%s doc_id=%s question=%s",
+        req.chat_id, req.doc_id, req.question,
     )
 
     try:
@@ -256,7 +442,8 @@ async def query(req: QueryRequest):
         else:
             logger.warning("No fallback context available")
 
-    history_text = format_history(session["history"]) if session is not None else ""
+    history = storage.history_for_prompt(chat["chat_id"]) if chat else []
+    history_text = format_history(history)
     inputs = {"context": context, "question": req.question, "history": history_text}
 
     try:
@@ -271,14 +458,12 @@ async def query(req: QueryRequest):
     answer = result
     logger.info("Model returned (took %.3fs) — answer length=%d", took_model, len(str(answer)))
 
-    if session is not None:
-        session["history"].append({"user": req.question, "assistant": answer})
+    debug = _gather_debug(docs, snippets, took_retrieval, took_model, doc_info)
+    _persist_turn(chat, req.question, str(answer),
+                  metrics={"retrieval_time_s": took_retrieval, "model_time_s": took_model},
+                  sources=snippets)
 
-    return {
-        "answer": answer,
-        "doc_id": doc_id,
-        "debug": _gather_debug(docs, snippets, took_retrieval, took_model, doc_info),
-    }
+    return {"answer": answer, "doc_id": doc_id, "debug": debug}
 
 
 def _sse(event: str, data: str) -> str:
@@ -289,10 +474,10 @@ def _sse(event: str, data: str) -> str:
 
 @app.post("/query/stream")
 async def query_stream(req: QueryRequest):
-    retriever, session, doc_id = _resolve_retriever(req)
+    retriever, chat, doc_id = _resolve_retriever(req)
     logger.info(
-        "Stream query: session_id=%s doc_id=%s question=%s",
-        req.session_id, req.doc_id, req.question,
+        "Stream query: chat_id=%s doc_id=%s question=%s",
+        req.chat_id, req.doc_id, req.question,
     )
 
     try:
@@ -311,7 +496,8 @@ async def query_stream(req: QueryRequest):
         if fb:
             context = fb
 
-    history_text = format_history(session["history"]) if session is not None else ""
+    history = storage.history_for_prompt(chat["chat_id"]) if chat else []
+    history_text = format_history(history)
     inputs = {"context": context, "question": req.question, "history": history_text}
 
     async def event_stream():
@@ -332,12 +518,15 @@ async def query_stream(req: QueryRequest):
 
         took_model = time.time() - start
         answer = "".join(full)
-        if session is not None:
-            session["history"].append({"user": req.question, "assistant": answer})
-
         debug = _gather_debug(docs, snippets, took_retrieval, took_model, doc_info)
-        # Final event carries the debug envelope so the client gets parity with /query.
-        import json
+
+        try:
+            _persist_turn(chat, req.question, answer,
+                          metrics={"retrieval_time_s": took_retrieval, "model_time_s": took_model},
+                          sources=snippets)
+        except Exception as e:
+            logger.error("Failed to persist chat turn: %s", e)
+
         yield _sse("done", json.dumps({"doc_id": doc_id, "debug": debug}))
 
     return StreamingResponse(
@@ -351,5 +540,5 @@ async def query_stream(req: QueryRequest):
 def status():
     return {
         "docs": {k: {"filename": v["filename"]} for k, v in DOCS.items()},
-        "sessions": list(SESSIONS.keys()),
+        "chats": [c["chat_id"] for c in storage.list_chats()],
     }
